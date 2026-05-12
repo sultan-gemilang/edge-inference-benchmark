@@ -3,6 +3,8 @@ logs
 
 # Model Folder
 models
+compressed-models
+pruned_models
 
 # Jetson Files
 *.deb
