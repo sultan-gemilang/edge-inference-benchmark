@@ -7,7 +7,7 @@ sleep 60
 python -u qwen-edge-benchmark.py \
     --model_path Qwen/Qwen2.5-1.5B --method pretrained \
     --warmup 3 --benchmark 10 --max_new_tokens 200 \
-    --log_file qwen_pretrained_log_stress.txt \
+    --log_file qwen_pretrained_log.txt \
     | tee logs/qwen_pretrained_terminal.txt
 sleep 60
 
