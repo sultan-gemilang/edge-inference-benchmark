@@ -60,6 +60,9 @@ class LLMLatencyBenchmark:
     def get_model_identifier(self):
         path = self.model_path.rstrip('/')
         model_name = os.path.basename(path)
+        if model_name == "pytorch_model.bin":
+            model_name = os.path.basename(os.path.dirname(path))
+        
         if model_name.endswith('.pt'):
             model_name = model_name[:-3]
         
@@ -177,25 +180,32 @@ class LLMLatencyBenchmark:
             raise e           
 
     def load_calibration_dataset(self, num_samples, input_length):
-        """Downloading WikiText2, padding/truncating to exact length."""
+        """Downloading WikiText2, aggregating, and chunking to exact lengths."""
         print(f"\n=== Phase 2: Loading Dataset ({num_samples} samples, strict length: {input_length}) ===")
         dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="test", streaming=False)
         
         self.prompts = []
-        for item in dataset:
-            text = item['text']
-            if len(text.strip()) == 0:
-                continue
-                
-            tokens = self.tokenizer(text, return_tensors="pt")
-            if tokens.input_ids.shape[1] >= input_length:
-                # Truncate to exact length
-                truncated_ids = tokens.input_ids[:, :input_length]
-                prompt_text = self.tokenizer.decode(truncated_ids[0], skip_special_tokens=True)
-                self.prompts.append(prompt_text)
-                
-            if len(self.prompts) >= num_samples:
+        
+        # 1. Stitch all valid text together into one giant string
+        full_text = " ".join([item['text'] for item in dataset if len(item['text'].strip()) > 0])
+        
+        # 2. Tokenize the giant string (this creates a massive 1D array of tokens)
+        all_tokens = self.tokenizer(full_text, return_tensors="pt").input_ids[0]
+        
+        # 3. Slice out perfect chunks of 'input_length' tokens
+        for i in range(num_samples):
+            start_idx = i * input_length
+            end_idx = start_idx + input_length
+            
+            # Stop if we somehow run out of text
+            if end_idx > len(all_tokens):
+                print(f"Warning: Dataset exhausted. Only managed to create {i} samples.")
                 break
+                
+            # Grab the chunk and decode it back into text
+            chunk_ids = all_tokens[start_idx:end_idx]
+            prompt_text = self.tokenizer.decode(chunk_ids, skip_special_tokens=True)
+            self.prompts.append(prompt_text)
                 
         print(f"Successfully loaded {len(self.prompts)} standardized prompts.")
 
