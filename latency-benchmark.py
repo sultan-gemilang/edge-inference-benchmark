@@ -13,6 +13,12 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStream
 from peft import PeftModel
 from datasets import load_dataset
 
+try:
+    from vllm import LLM, SamplingParams
+    VLLM_AVAILABLE = True
+except ImportError:
+    VLLM_AVAILABLE = False
+
 # --- Configuration ---
 LOG_PATH = "logs"
 CSV_PATH = os.path.join(LOG_PATH, "csv_results")
@@ -35,10 +41,11 @@ class LLMLatencyBenchmark:
         }
 
         self.model = None
-        self.tokenizer = None 
+        self.tokenizer = None
         self.tegra_process = None
         self.model_path = None
         self.method = None
+        self.vllm_model = None
         self.prompts = []       # Holds the dynamically loaded dataset
 
     def start_hardware_logger(self):
@@ -134,13 +141,19 @@ class LLMLatencyBenchmark:
             write_summary_row("Detokenization(s)", self.metrics["detokenization"])
             write_summary_row("Peak_VRAM(GB)", self.metrics["peak_vram"])
             
-    def load_model_tokenizer(self, model_path, method, adapter_path=None):
+    def load_model_tokenizer(self, model_path, method, adapter_path=None,
+                             gpu_mem_util=0.5, max_model_len=None, enforce_eager=False):
         self.model_path = model_path
         self.method = method
         
         print(f"\n=== Phase 1: Loading Model ({method}) ===")
         if self.model:
             del self.model
+            self.model = None
+            torch.cuda.empty_cache()
+        if self.vllm_model:
+            del self.vllm_model
+            self.vllm_model = None
             torch.cuda.empty_cache()
         
         torch.cuda.synchronize()
@@ -162,6 +175,25 @@ class LLMLatencyBenchmark:
                 self.model = PeftModel.from_pretrained(base_model, adapter_path, torch_dtype=torch.float16)
                 self.model = self.model.merge_and_unload()
                 self.model.to("cuda")
+            elif method == "vllm":
+                if not VLLM_AVAILABLE:
+                    raise RuntimeError("vLLM is not installed. Cannot use method='vllm'.")
+                # The benchmark only ever sends one sequence at a time, so cap the
+                # batch/sequence budget. This keeps vLLM's memory-profiling forward
+                # pass small (default max_num_batched_tokens=8192 reserves activation
+                # memory for 8192 tokens, which exhausts the budget on tight unified
+                # memory like Jetson and leaves nothing for the KV cache).
+                self.vllm_model = LLM(
+                    model=model_path,
+                    dtype="float16",
+                    gpu_memory_utilization=gpu_mem_util,
+                    max_model_len=max_model_len,
+                    max_num_seqs=1,
+                    max_num_batched_tokens=max_model_len,
+                    enforce_eager=enforce_eager,
+                    disable_log_stats=False,  # populate RequestStateStats for TTFT/TPOT
+                )
+                self.tokenizer = AutoTokenizer.from_pretrained(model_path)
             else:
                 raise ValueError(f"Unknown loading method: {method}")
             
@@ -210,9 +242,13 @@ class LLMLatencyBenchmark:
         print(f"Successfully loaded {len(self.prompts)} standardized prompts.")
 
     def run_benchmark(self, warmup_rounds, output_length):
-        if not self.model or not self.tokenizer or not self.prompts:
+        if not (self.model or self.vllm_model) or not self.tokenizer or not self.prompts:
             raise RuntimeError("Model, tokenizer, and dataset must be loaded before benchmarking.")
-        
+
+        if self.method == "vllm":
+            self.run_benchmark_vllm(warmup_rounds, output_length)
+            return
+
         try:
             print(f"\n=== Phase 3: Warmup {warmup_rounds} Rounds ===")
             dummy_input = self.tokenizer("Hello, world!", return_tensors="pt").to("cuda")
@@ -312,6 +348,84 @@ class LLMLatencyBenchmark:
             self.stop_hardware_logger()
             self.print_report()
                 
+    def run_benchmark_vllm(self, warmup_rounds, output_length):
+        """vLLM-based benchmark path. Matches run_benchmark() metric granularity."""
+        if not self.vllm_model or not self.tokenizer or not self.prompts:
+            raise RuntimeError("vllm_model, tokenizer, and dataset must be loaded.")
+
+        sampling_params = SamplingParams(
+            min_tokens=output_length,
+            max_tokens=output_length,
+            temperature=0.0,
+        )
+
+        try:
+            print(f"\n=== Phase 3: Warmup {warmup_rounds} Rounds ===")
+            warmup_params = SamplingParams(min_tokens=10, max_tokens=10, temperature=0.0)
+            for _ in range(warmup_rounds):
+                self.vllm_model.generate(["Hello, world!"], warmup_params)
+            print("Warmup completed.")
+
+            self.start_hardware_logger()
+            benchmark_rounds = len(self.prompts)
+            print(f"\n=== Phase 4: Benchmarking {benchmark_rounds} Rounds ===")
+
+            for i, prompt_text in enumerate(self.prompts):
+                print(f"Round {i+1}/{benchmark_rounds}...", end="", flush=True)
+
+                # A. Input token count
+                input_ids = self.tokenizer(prompt_text, return_tensors="pt").input_ids
+                input_token_count = input_ids.shape[1]
+                self.metrics["input_tokens"].append(input_token_count)
+
+                # B. Generation
+                torch.cuda.reset_peak_memory_stats()
+                t_wall_start = time.perf_counter()
+                outputs = self.vllm_model.generate([prompt_text], sampling_params)
+                t_wall_end = time.perf_counter()
+                output = outputs[0]
+
+                # C. Timing — vLLM V1 RequestStateStats (monotonic engine-core timestamps),
+                #    fall back to wall-clock if stats are unavailable.
+                stats = getattr(output, "metrics", None)
+                if (stats is not None
+                        and getattr(stats, "first_token_ts", 0.0)
+                        and getattr(stats, "last_token_ts", 0.0)
+                        and getattr(stats, "scheduled_ts", 0.0)):
+                    ttft = stats.first_token_ts - stats.scheduled_ts   # prefill latency
+                    tgt  = stats.last_token_ts - stats.scheduled_ts    # prefill + decode
+                else:
+                    tgt  = t_wall_end - t_wall_start
+                    ttft = tgt  # fallback: cannot isolate first-token time from wall-clock
+
+                num_tokens = len(output.outputs[0].token_ids)
+                tpot = (tgt - ttft) / (num_tokens - 1) if num_tokens > 1 else 0.0
+                tps  = num_tokens / tgt if tgt > 0 else 0.0
+
+                self.metrics["ttft"].append(ttft)
+                self.metrics["tgt"].append(tgt)
+                self.metrics["tpot"].append(tpot)
+                self.metrics["tps"].append(tps)
+                self.metrics["output_tokens"].append(num_tokens)
+                # export_to_csv derives num_rounds from len(metrics["tokenization"]),
+                # so 0.0 placeholders are required to keep the row count correct.
+                self.metrics["tokenization"].append(0.0)
+                self.metrics["detokenization"].append(0.0)
+
+                # D. VRAM
+                peak_mem = torch.cuda.max_memory_allocated() / (1024**3)
+                self.metrics["peak_vram"].append(peak_mem)
+
+                print(f" Done. (Input: {input_token_count}, Output: {num_tokens}, TPS: {tps:.2f})")
+
+        except KeyboardInterrupt:
+            print("\nBenchmark interrupted by user!")
+        except Exception as e:
+            print(f"\nAn error occurred: {e}")
+        finally:
+            self.stop_hardware_logger()
+            self.print_report()
+
     def print_report(self):
         print("\n" + "="*50)
         print("       BENCHMARK REPORT")
@@ -347,7 +461,7 @@ class LLMLatencyBenchmark:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", type=str, required=True, default="Qwen/Qwen2.5-1.5B", help="Path or HF ID of the model")
-    parser.add_argument("--method", type=str, default="pretrained", choices=["pretrained", "pruned", "pruned-lora"])
+    parser.add_argument("--method", type=str, default="pretrained", choices=["pretrained", "pruned", "pruned-lora", "vllm"])
     parser.add_argument("--adapter", type=str, default=None, help="Path to LoRA adapter (optional)")
     
     # New matrix arguments
@@ -357,13 +471,22 @@ if __name__ == "__main__":
     
     parser.add_argument("--warmup", type=int, default=2, help="Number of warmup rounds")
     parser.add_argument("--log_file", type=str, default="benchmark_log.txt", help="Path to save hardware log")
-    
+
+    # vLLM memory controls (unified-memory devices like Jetson Orin need lower values)
+    parser.add_argument("--gpu_mem_util", type=float, default=0.55, help="vLLM gpu_memory_utilization fraction")
+    parser.add_argument("--max_model_len", type=int, default=None, help="vLLM max_model_len; defaults to input_len + output_len + 64")
+    parser.add_argument("--enforce_eager", action="store_true", help="Disable CUDA graph capture (saves memory/startup time)")
+
     args = parser.parse_args()
+
+    max_model_len = args.max_model_len or (args.input_len + args.output_len + 64)
 
     bench = LLMLatencyBenchmark()
     
     try:
-        bench.load_model_tokenizer(model_path=args.model_path, method=args.method, adapter_path=args.adapter)
+        bench.load_model_tokenizer(model_path=args.model_path, method=args.method, adapter_path=args.adapter,
+                                   gpu_mem_util=args.gpu_mem_util, max_model_len=max_model_len,
+                                   enforce_eager=args.enforce_eager)
         bench.load_calibration_dataset(num_samples=args.num_samples, input_length=args.input_len)
         bench.run_benchmark(warmup_rounds=args.warmup, output_length=args.output_len)
     except Exception as e:
